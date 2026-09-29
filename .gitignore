@@ -37,3 +37,5 @@ build/
 
 ### Mac OS ###
 .DS_Store
+### Pointer analysis runtime data ###
+/pointer-analysis-data/
