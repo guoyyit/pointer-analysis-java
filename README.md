@@ -69,8 +69,29 @@ same inputs (asserted by `AnalysisEngineTest`, `SolverSanityTest`, and the
 `/api/verify` cross-check). When the changed region does not affect most of the
 reachable program (e.g. a leaf file), re-analysis cost is proportional to the
 affected region rather than total program size. The performance-bound test
-(`-Drun.perf=true`) demonstrates ~90x speedup for a leaf-file change in a
-2,500-class reachable program.
+runs as part of the default suite and demonstrates ~60x speedup for a
+leaf-file change in a 2,500-class reachable program.
+
+### Idempotent incremental updates
+
+Each incremental update is identified by a deterministic **change key**: the
+SHA-256 of the base revision plus the canonical change set (added/changed
+file paths with their content hashes, plus deleted paths). Before applying an
+update, the service writes a `pending-change` marker containing the change key
+and the target revision. After the snapshot is durably written, the marker is
+cleared.
+
+On restart the service reconciles the marker:
+
+* If the marker's target revision equals the persisted snapshot revision, the
+  update committed; its change key is remembered so a retry is a no-op.
+* If the marker's target revision is ahead of the persisted snapshot, the
+  update did not commit; the stale marker is discarded and the change can be
+  applied exactly once.
+
+A retry of the same change (same change key) returns the stored view without
+advancing the revision or producing side effects. A different change applies
+normally. This is asserted by `CrashRecoveryTest`.
 
 ## Concurrency model
 
@@ -84,9 +105,13 @@ affected region rather than total program size. The performance-bound test
   durably stored.
 * All sets are sorted and worklists are drained in total order, so results are
   deterministic for identical inputs regardless of query/update interleaving.
-* `parallelism` configures per-file parse/processing parallelism at the service
-  boundary; global fixpoint solving is intentionally single-threaded to preserve
-  an exact, order-independent result.
+* `parallelism` configures per-file lexing/parsing parallelism. Each file is
+  parsed independently and results are merged into sorted maps, so the outcome
+  is identical regardless of the value or thread scheduling. On a large input
+  (thousands of files) parallel parsing is measurably faster than sequential
+  parsing (asserted by `ParallelParsingTest` and `PerformanceBoundTest`).
+  Global fixpoint solving is intentionally single-threaded to preserve an
+  exact, order-independent result.
 
 ## Crash recovery
 
@@ -97,12 +122,34 @@ State lives under `pointer-analysis.storage-dir` (default `./pointer-analysis-da
   moved into place (never torn).
 * `revision` — the latest applied revision (monotonic), preventing an
   incremental change from being applied twice after restart.
+* `pending-change` — the in-flight incremental change key and target revision,
+  reconciled on recovery (see below).
 * `query-history.jsonl` — append-only, one JSON record per answered query;
   previously published answers are never lost.
 
 On startup the service restores the latest consistent snapshot and full query
-history. Subsequent updates continue from that revision; their results equal a
-fresh full rebuild (see `AnalysisServiceTest.recoveredIncrementalMatchesFreshFullRebuild`).
+history and reconciles the pending-change marker. Subsequent updates continue
+from that revision; their results equal a fresh full rebuild (see
+`AnalysisServiceTest.recoveredIncrementalMatchesFreshFullRebuild` and
+`CrashRecoveryTest`).
+
+### Crash timings covered by tests
+
+`CrashRecoveryTest` simulates crashes at every point of the incremental commit
+protocol:
+
+* **Before the snapshot write** — the pending marker exists but the snapshot
+  is still at the previous revision. Recovery discards the marker; the change
+  applies exactly once.
+* **During the snapshot write** — a store failure throws before the atomic
+  move. The caller sees the failure; the snapshot is unchanged. A restart
+  rolls back to the last consistent snapshot.
+* **After the snapshot write** — the snapshot is at the new revision but the
+  pending marker was not cleared. Recovery recognizes the committed change
+  and remembers its key; a retry is a no-op.
+
+In every case the persisted state, the published snapshot and the query
+results align at the last consistent state.
 
 ## HTTP API
 
@@ -129,15 +176,36 @@ or `<root>` / `*`.
 |-----------------------------------|-------------|----------------------------------|
 | `pointer-analysis.storage-dir`    | `./pointer-analysis-data` | persistence directory |
 | `contextK` (build config)         | `1`         | call-string length (`0` = CI)    |
-| `parallelism` (build config)      | CPU count   | per-file parse worker count      |
+| `parallelism` (build config)      | CPU count   | per-file lexing/parsing worker count |
 | `entryClass` / `entryMethod`      | `Main`/`main` | static entry point            |
 
 ## Build and test
 
 ```bash
-mvn test                       # all unit/service/web tests (perf test skipped)
-mvn test -Drun.perf=true       # include the performance-bound test
+mvn test                       # all tests including the performance-bound test
 mvn spring-boot:run            # start the HTTP service on port 8080
+```
+
+## Performance verification
+
+`PerformanceBoundTest` runs as part of the default suite and writes its results
+to `target/perf-results.txt` on each run. The file contains one `key=value`
+pair per line:
+
+* `parse_sequential_ms` / `parse_parallel_ms` — best-of-5 parse time for ~2,500
+  files with `parallelism=1` vs `parallelism=4`.
+* `parse_speedup` — sequential / parallel; must be `> 1`.
+* `full_rebuild_ms` — best-of-5 full analysis time for a 2,500-class program.
+* `incremental_ms` — single-file incremental reanalysis time (solve p1 once,
+  then measure only the update).
+* `incremental_speedup` — full / incremental; must be `>= 5`.
+
+A regression in either bound fails the test. The results file is appended to
+on each run, so it can be compared across builds for longer-term trend
+analysis. To run the benchmark in isolation:
+
+```bash
+mvn test -Dtest=PerformanceBoundTest
 ```
 
 ## Known limitations
@@ -150,7 +218,8 @@ mvn spring-boot:run            # start the HTTP service on port 8080
 * Library code outside the provided sources is treated as nonexistent; calls to
   unresolved methods are ignored.
 * Global fixpoint solving is single threaded for exact determinism; only
-  file-level parsing/processing is parallelized.
+  file-level lexing/parsing is parallelized. The parallel speedup depends on
+  the number of files; small inputs show little or no difference.
 * After a hard restart, the first update re-derives the provenance graph from
   the persisted snapshot before applying the change; later updates in the same
   process reuse it directly.

@@ -47,6 +47,7 @@ public final class AnalysisService {
     private AnalysisConfig config = AnalysisConfig.defaults();
     private Program currentProgram;
     private PointerAnalysisSolver solver;
+    private String lastAppliedKey;
 
     public AnalysisService(RevisionStore store) {
         this.store = Objects.requireNonNull(store);
@@ -62,6 +63,15 @@ public final class AnalysisService {
                 this.solver = null;
                 this.published.set(new RevisionView(snapshot.revision(), snapshot,
                         List.copyOf(store.queryHistory())));
+            }
+            RevisionStore.PendingChange pending = store.loadPendingChange();
+            if (pending != null) {
+                if (snapshot != null && snapshot.revision() == pending.targetRevision()) {
+                    // The update committed (snapshot write succeeded); remember its key.
+                    this.lastAppliedKey = pending.changeKey();
+                }
+                // else: the update did not commit; discard the stale marker.
+                store.clearPendingChange();
             }
         } catch (IOException e) {
             throw new UncheckedIOException("recovery failed", e);
@@ -84,11 +94,10 @@ public final class AnalysisService {
         writerLock.lock();
         try {
             this.config = requested != null ? requested : AnalysisConfig.defaults();
-            Program program = SourceParser.parse(pathToContent);
+            Program program = SourceParser.parse(pathToContent, config.parallelism());
             this.solver = new PointerAnalysisSolver(this.config);
             PointerAnalysisSnapshot snapshot = solver.solve(program);
-            this.currentProgram = program;
-            return publish(snapshot);
+            return commit(snapshot, program, null);
         } finally {
             writerLock.unlock();
         }
@@ -98,20 +107,39 @@ public final class AnalysisService {
         writerLock.lock();
         try {
             requireReady();
-            Program nextProgram = SourceParser.parse(fullSourcesAfterChange);
+            RevisionView previous = published.get();
+            Program nextProgram = SourceParser.parse(fullSourcesAfterChange, config.parallelism());
             ChangeSet changeSet = ChangeSet.diff(currentProgram, nextProgram);
-            PointerAnalysisSnapshot previous = published.get().snapshot();
-            PointerAnalysisSnapshot next;
-            if (solver != null) {
-                next = solver.update(currentProgram, previous, nextProgram, changeSet);
-            } else {
-                PointerAnalysisSolver fresh = new PointerAnalysisSolver(config);
-                fresh.solve(currentProgram);
-                next = fresh.update(currentProgram, previous, nextProgram, changeSet);
-                this.solver = fresh;
+            if (changeSet.isEmpty()) {
+                return previous;
             }
-            this.currentProgram = nextProgram;
-            return publish(next);
+            String changeKey = changeSet.fingerprint(previous.revision(), nextProgram);
+            if (changeKey.equals(lastAppliedKey)) {
+                return previous;
+            }
+            long targetRevision = previous.revision() + 1;
+            try {
+                store.writePendingChange(changeKey, targetRevision);
+            } catch (IOException e) {
+                throw new UncheckedIOException("failed to write pending change marker", e);
+            }
+            PointerAnalysisSnapshot next;
+            try {
+                if (solver != null) {
+                    next = solver.update(currentProgram, previous.snapshot(), nextProgram,
+                            changeSet);
+                } else {
+                    PointerAnalysisSolver fresh = new PointerAnalysisSolver(config);
+                    fresh.solve(currentProgram);
+                    next = fresh.update(currentProgram, previous.snapshot(), nextProgram,
+                            changeSet);
+                    this.solver = fresh;
+                }
+            } catch (RuntimeException e) {
+                store.clearPendingChange();
+                throw e;
+            }
+            return commit(next, nextProgram, changeKey);
         } finally {
             writerLock.unlock();
         }
@@ -121,11 +149,10 @@ public final class AnalysisService {
         writerLock.lock();
         try {
             requireReady();
-            Program nextProgram = SourceParser.parse(fullSourcesAfterChange);
+            Program nextProgram = SourceParser.parse(fullSourcesAfterChange, config.parallelism());
             this.solver = new PointerAnalysisSolver(config);
             PointerAnalysisSnapshot next = solver.solve(nextProgram);
-            this.currentProgram = nextProgram;
-            return publish(next);
+            return commit(next, nextProgram, null);
         } finally {
             writerLock.unlock();
         }
@@ -143,7 +170,7 @@ public final class AnalysisService {
         } finally {
             writerLock.unlock();
         }
-        Program nextProgram = SourceParser.parse(fullSourcesAfterChange);
+        Program nextProgram = SourceParser.parse(fullSourcesAfterChange, snapshotConfig.parallelism());
         ChangeSet changeSet = ChangeSet.diff(programBefore, nextProgram);
 
         PointerAnalysisSolver incrementalSolver = new PointerAnalysisSolver(snapshotConfig);
@@ -185,12 +212,16 @@ public final class AnalysisService {
                 + " onlyIncremental=" + onlyIncremental;
     }
 
-    private RevisionView publish(PointerAnalysisSnapshot snapshot) {
+    private RevisionView commit(PointerAnalysisSnapshot snapshot, Program program,
+                                String changeKey) {
         try {
             store.saveSnapshot(snapshot);
             RevisionView view = new RevisionView(snapshot.revision(), snapshot,
                     List.copyOf(store.queryHistory()));
             published.set(view);
+            store.clearPendingChange();
+            this.currentProgram = program;
+            this.lastAppliedKey = changeKey;
             return view;
         } catch (IOException e) {
             throw new UncheckedIOException("failed to publish snapshot", e);

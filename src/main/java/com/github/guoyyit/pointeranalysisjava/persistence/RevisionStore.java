@@ -28,11 +28,12 @@ import java.util.stream.Stream;
  * being applied twice. Query history is an append-only JSON-lines file, so
  * every answer that was visible before a crash remains available afterwards.
  */
-public final class RevisionStore {
+public class RevisionStore {
 
     private static final String SNAPSHOT = "snapshot.json";
     private static final String HISTORY = "query-history.jsonl";
     private static final String REVISION = "revision";
+    private static final String PENDING = "pending-change";
 
     private final Path storageDir;
     private final ObjectMapper mapper;
@@ -136,6 +137,52 @@ public final class RevisionStore {
         Files.deleteIfExists(snapshotPath());
         Files.deleteIfExists(historyPath());
         Files.deleteIfExists(storageDir.resolve(REVISION));
+        Files.deleteIfExists(storageDir.resolve(PENDING));
         sequence.set(0);
+    }
+
+    /**
+     * Records that an incremental update is about to be applied. The marker is
+     * written before the update runs, so a crash at any point leaves either a
+     * pending marker (update may not have committed) or no marker (update
+     * committed or never started).
+     */
+    public synchronized void writePendingChange(String changeKey, long targetRevision)
+            throws IOException {
+        Files.writeString(storageDir.resolve(PENDING),
+                changeKey + "\n" + targetRevision + "\n", StandardCharsets.UTF_8,
+                StandardOpenOption.CREATE, StandardOpenOption.TRUNCATE_EXISTING,
+                StandardOpenOption.WRITE);
+    }
+
+    /** Removes the pending-change marker once the update has committed. */
+    public synchronized void clearPendingChange() {
+        try {
+            Files.deleteIfExists(storageDir.resolve(PENDING));
+        } catch (IOException e) {
+            // Non-fatal: a stale pending marker is reconciled on recovery.
+        }
+    }
+
+    /**
+     * Reads the pending-change marker, if present.
+     *
+     * @return the pending change key and target revision, or {@code null} if
+     *         no marker exists
+     */
+    public synchronized PendingChange loadPendingChange() throws IOException {
+        Path path = storageDir.resolve(PENDING);
+        if (!Files.exists(path)) {
+            return null;
+        }
+        List<String> lines = Files.readAllLines(path, StandardCharsets.UTF_8);
+        if (lines.size() < 2) {
+            return null;
+        }
+        return new PendingChange(lines.get(0).trim(), Long.parseLong(lines.get(1).trim()));
+    }
+
+    /** A recorded in-flight incremental change. */
+    public record PendingChange(String changeKey, long targetRevision) {
     }
 }

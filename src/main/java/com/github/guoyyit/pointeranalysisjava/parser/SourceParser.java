@@ -16,6 +16,10 @@ import java.util.Map;
 import java.util.Set;
 import java.util.TreeMap;
 import java.util.TreeSet;
+import java.util.concurrent.Callable;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
 
 /**
  * Parses source files of the supported Java subset into a {@link Program}.
@@ -36,27 +40,82 @@ public final class SourceParser {
     }
 
     public static Program parse(Map<String, String> pathToContent) {
+        return parse(pathToContent, 1);
+    }
+
+    /**
+     * Parses all files into a {@link Program}.
+     *
+     * @param parallelism number of worker threads for per-file lexing/parsing;
+     *                    values {@code <= 1} run sequentially. Each file is
+     *                    parsed independently and results are merged into sorted
+     *                    maps, so the outcome is identical regardless of the
+     *                    value or thread scheduling.
+     */
+    public static Program parse(Map<String, String> pathToContent, int parallelism) {
+        List<String> paths = new ArrayList<>(pathToContent.keySet());
+        Collections.sort(paths);
+
+        List<FileParseResult> perFile;
+        if (parallelism <= 1 || paths.size() <= 1) {
+            perFile = new ArrayList<>(paths.size());
+            for (String path : paths) {
+                perFile.add(parseFile(path, pathToContent.get(path)));
+            }
+        } else {
+            ExecutorService pool = Executors.newFixedThreadPool(parallelism, r -> {
+                Thread t = new Thread(r, "source-parser");
+                t.setDaemon(true);
+                return t;
+            });
+            try {
+                List<Future<FileParseResult>> futures = new ArrayList<>(paths.size());
+                for (String path : paths) {
+                    String content = pathToContent.get(path);
+                    futures.add(pool.submit(() -> parseFile(path, content)));
+                }
+                perFile = new ArrayList<>(paths.size());
+                for (Future<FileParseResult> future : futures) {
+                    perFile.add(future.get());
+                }
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                throw new ParseException("parallel parsing interrupted");
+            } catch (Exception e) {
+                if (e.getCause() instanceof RuntimeException re) {
+                    throw re;
+                }
+                throw new ParseException("parallel parsing failed: " + e.getCause());
+            } finally {
+                pool.shutdownNow();
+            }
+        }
+
         TreeMap<String, JClass> classes = new TreeMap<>();
         TreeMap<String, List<String>> classesByFile = new TreeMap<>();
         TreeMap<String, String> sourceHashByFile = new TreeMap<>();
-
-        List<String> paths = new ArrayList<>(pathToContent.keySet());
-        Collections.sort(paths);
-        for (String path : paths) {
-            String content = pathToContent.get(path);
-            sourceHashByFile.put(path, sha256(content));
-            List<Token> tokens = Lexer.tokenize(path, content);
-            List<JClass> fileClasses = new ClassParser(path, tokens).parseClasses();
+        for (FileParseResult result : perFile) {
+            sourceHashByFile.put(result.path(), result.hash());
             List<String> classNames = new ArrayList<>();
-            for (JClass parsed : fileClasses) {
+            for (JClass parsed : result.classes()) {
                 if (classes.putIfAbsent(parsed.name(), parsed) != null) {
                     throw new ParseException("duplicate class definition: " + parsed.name());
                 }
                 classNames.add(parsed.name());
             }
-            classesByFile.put(path, List.copyOf(classNames));
+            classesByFile.put(result.path(), List.copyOf(classNames));
         }
         return new Program(classes, classesByFile, sourceHashByFile);
+    }
+
+    private record FileParseResult(String path, String hash, List<JClass> classes) {
+    }
+
+    private static FileParseResult parseFile(String path, String content) {
+        String hash = sha256(content);
+        List<Token> tokens = Lexer.tokenize(path, content);
+        List<JClass> fileClasses = new ClassParser(path, tokens).parseClasses();
+        return new FileParseResult(path, hash, fileClasses);
     }
 
     static String sha256(String content) {

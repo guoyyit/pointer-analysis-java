@@ -61,6 +61,20 @@ class AnalysisControllerTest {
                 .andExpect(jsonPath("$.length()").value(2));
     }
 
+    @Test
+    void parallelismConfigIsAcceptedAndUpdateIsIdempotent() throws Exception {
+        String build = "{\"sources\":{\"Main.java\":" + quote(SOURCE)
+                + "},\"config\":{\"contextK\":1,\"parallelism\":4}}";
+        mvc.perform(post("/api/build").contentType(MediaType.APPLICATION_JSON).content(build))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.revision").value(1));
+
+        String update = "{\"sources\":{\"Main.java\":" + quote(SOURCE) + "}}";
+        mvc.perform(post("/api/update").contentType(MediaType.APPLICATION_JSON).content(update))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.revision").value(1));
+    }
+
     private static String quote(String text) {
         StringBuilder builder = new StringBuilder("\"");
         for (char c : text.toCharArray()) {
