@@ -68,9 +68,20 @@ Consequently, the incremental result is **identical to a full rebuild** for the
 same inputs (asserted by `AnalysisEngineTest`, `SolverSanityTest`, and the
 `/api/verify` cross-check). When the changed region does not affect most of the
 reachable program (e.g. a leaf file), re-analysis cost is proportional to the
-affected region rather than total program size. The performance-bound test
-(`-Drun.perf=true`) demonstrates ~90x speedup for a leaf-file change in a
-2,500-class reachable program.
+affected region rather than total program size. This is enforced automatically
+with no opt-in flag by `PerformanceBoundTest`, which runs as part of plain
+`mvn test`:
+* a change confined to one reachable file tears down and re-registers the same
+  small number of provenance derivations whether the surrounding program has
+  200 or 2,500 unrelated classes (`unrelatedCodeGrowthDoesNotInflateIncrementalWork`);
+* the incremental re-analysis is materially cheaper than a full rebuild
+  (`oneFileChangeIsRegionBoundedAndMuchCheaperThanFullRebuild`).
+
+The primary regression signal is machine-independent work counters
+(`affectedSites`, `derivationsRemoved`, `derivationsRegistered`), not wall
+time; best-of-5 millisecond timings (with warm-up) are a secondary signal.
+Every run writes a JSON record to `target/benchmark-results/<scenario>-latest.json`
+plus a timestamped copy, so results can be compared across builds.
 
 ## Concurrency model
 
@@ -84,9 +95,26 @@ affected region rather than total program size. The performance-bound test
   durably stored.
 * All sets are sorted and worklists are drained in total order, so results are
   deterministic for identical inputs regardless of query/update interleaving.
-* `parallelism` configures per-file parse/processing parallelism at the service
-  boundary; global fixpoint solving is intentionally single-threaded to preserve
-  an exact, order-independent result.
+* `parallelism` (a build-time config field, `>= 1`) **really changes
+  execution**: source files are parsed concurrently on a fixed pool of
+  `pointer-analysis-parser-<pool>-<n>` daemon threads, capped at the configured
+  worker count. With `parallelism=1` (or a single input file) parsing runs on
+  the calling thread only.
+* Files are independent parse units: each file is tokenized and parsed by
+  exactly one worker, and results are merged in sorted file order on the
+  calling thread. The global fixpoint solver stays single-threaded on purpose,
+  so thread scheduling cannot change any fact. Points-to sets, alias answers
+  and query histories are identical at every parallelism value and across
+  repeated runs; see `ParallelAnalysisTest`.
+* How to observe the difference locally:
+  * `GET /api/status` returns `configuredParallelism`, `parseParallelism`,
+    `parserWorkerThreads` (names of threads that actually parsed files),
+    `parseMillis`, `solveMillis`, `incrementalMillis`, `lastOutcome`, plus
+    `affectedSites` / `derivationsRemoved` / `derivationsRegistered` after an
+    incremental update.
+  * Build with `"config":{"parallelism":8}` over many files and check that
+    `parserWorkerThreads` lists multiple worker threads; rebuild with
+    `"parallelism":1` and the list shrinks to the single calling thread.
 
 ## Crash recovery
 
@@ -94,15 +122,31 @@ State lives under `pointer-analysis.storage-dir` (default `./pointer-analysis-da
 
 * `snapshot.json` — the latest published snapshot (program, configuration,
   variable and field points-to maps), written to a temp file and atomically
-  moved into place (never torn).
-* `revision` — the latest applied revision (monotonic), preventing an
-  incremental change from being applied twice after restart.
+  moved into place. The atomic move is the commit point: a crash before it
+  leaves the previous snapshot intact; a crash after it leaves the new one.
+* `revision` — the revision of the committed snapshot. On startup
+  `RevisionStore.reconcileMarkerWithSnapshot()` realigns this marker with
+  `snapshot.json` (the snapshot is the source of truth), so a crash in the
+  window between snapshot commit and marker write cannot lose or double-apply
+  the change.
 * `query-history.jsonl` — append-only, one JSON record per answered query;
   previously published answers are never lost.
 
-On startup the service restores the latest consistent snapshot and full query
-history. Subsequent updates continue from that revision; their results equal a
-fresh full rebuild (see `AnalysisServiceTest.recoveredIncrementalMatchesFreshFullRebuild`).
+On startup the service restores the latest consistent snapshot, aligns the
+revision marker, and loads the full query history. Idempotency guarantees:
+* submitting sources identical to the current program (a retry, a duplicate
+  request, or the same change replayed after restart) returns the existing
+  revision with no new snapshot, no revision bump, and no query-history side
+  effects (`lastOutcome` is reported as `no-op-identical-sources`);
+* a change already committed before a crash is never applied a second time.
+
+Crash timing is covered by `CrashRecoveryTest`, which injects hard failures at
+`BEFORE_SNAPSHOT_WRITE` and `AFTER_SNAPSHOT_BEFORE_MARKER` and then asserts
+that the recovered durable state, the published snapshot and query answers all
+line up with a fresh full analysis. These tests are never conditionally
+skipped. After a crash-free restart the first update rebuilds the in-memory
+provenance graph from the persisted snapshot before applying the change; later
+updates in the same process reuse it directly.
 
 ## HTTP API
 
@@ -116,12 +160,19 @@ Base path: `/api`
 | `POST /verify`            | Cross-check incremental result vs full rebuild     |
 | `POST /query/points-to`   | `{context, path}` points-to query                  |
 | `POST /query/alias`       | `{context, left, right}` may-alias query           |
-| `GET  /status`            | Revision and program statistics                    |
+| `GET  /status`            | Revision, program statistics and execution metrics |
 | `GET  /history`           | Reproducible history of answered queries           |
 
 Access paths use `Class#method/arity#root.f1.f2`; the `Class#method/arity#`
 prefix is optional (entry method assumed). Contexts use `/`-separated call sites
 or `<root>` / `*`.
+
+`POST /build`, `/update` and `/rebuild` return the same body as
+`GET /status`. The execution-metric fields are `configuredParallelism`,
+`parseParallelism`, `parserWorkerThreads`, `parseMillis`, `solveMillis`,
+`incrementalMillis`, `lastOutcome` (`full-build` / `full-rebuild` /
+`incremental` / `no-op-identical-sources`) and, for incremental updates,
+`affectedSites`, `derivationsRemoved` and `derivationsRegistered`.
 
 ## Configuration
 
@@ -129,16 +180,24 @@ or `<root>` / `*`.
 |-----------------------------------|-------------|----------------------------------|
 | `pointer-analysis.storage-dir`    | `./pointer-analysis-data` | persistence directory |
 | `contextK` (build config)         | `1`         | call-string length (`0` = CI)    |
-| `parallelism` (build config)      | CPU count   | per-file parse worker count      |
+| `parallelism` (build config)      | CPU count   | concurrent per-file parse workers (`>= 1`) |
 | `entryClass` / `entryMethod`      | `Main`/`main` | static entry point            |
 
 ## Build and test
 
 ```bash
-mvn test                       # all unit/service/web tests (perf test skipped)
-mvn test -Drun.perf=true       # include the performance-bound test
+mvn test                       # all tests, including performance-bound acceptance
+mvn test -Dtest=PerformanceBoundTest  # only the performance-bound scenarios
 mvn spring-boot:run            # start the HTTP service on port 8080
 ```
+
+All tests run under plain `mvn test`; none require an environment variable or
+system property to be enabled. The performance-bound scenarios use warm-up and
+best-of-N timing plus deterministic work counters to stay reliable on loaded
+machines while still failing on a genuine regression toward full-rebuild cost.
+Benchmark output lands in `target/benchmark-results/` (cleaned by
+`mvn clean`); diff the `<scenario>-latest.json` files between builds to review
+performance changes.
 
 ## Known limitations
 
@@ -149,8 +208,10 @@ mvn spring-boot:run            # start the HTTP service on port 8080
   multi-object field locations beyond standard Andersen field sensitivity.
 * Library code outside the provided sources is treated as nonexistent; calls to
   unresolved methods are ignored.
-* Global fixpoint solving is single threaded for exact determinism; only
-  file-level parsing/processing is parallelized.
+* Parallelism is deliberately limited to independent per-file parsing. The
+  global fixpoint solver is single threaded so results cannot depend on thread
+  scheduling; within one process only parsing fans out, while the analyzed
+  snapshot itself is produced sequentially.
 * After a hard restart, the first update re-derives the provenance graph from
   the persisted snapshot before applying the change; later updates in the same
   process reuse it directly.

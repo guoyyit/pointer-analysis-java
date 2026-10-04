@@ -30,6 +30,32 @@ import java.util.stream.Stream;
  */
 public final class RevisionStore {
 
+    /** Points in the durable publication protocol where a crash can be simulated. */
+    public enum PublishPoint {
+        /** Before the new snapshot temp file is written. */
+        BEFORE_SNAPSHOT_WRITE,
+        /** After the snapshot is atomically in place, before the revision marker is fsynced. */
+        AFTER_SNAPSHOT_BEFORE_MARKER,
+        /** After both snapshot and marker are durable. */
+        AFTER_MARKER
+    }
+
+    /**
+     * Test hook fired at each durable publication point. Throwing from the
+     * hook simulates an immediate process crash: no in-memory state is rolled
+     * forward. Production code never registers a hook.
+     */
+    public interface PublishFailureHook {
+        void checkpoint(PublishPoint point, long revision);
+    }
+
+    /** Thrown by an injected failure hook; treated as a simulated hard crash. */
+    public static final class InjectedCrash extends RuntimeException {
+        public InjectedCrash(String message) {
+            super(message);
+        }
+    }
+
     private static final String SNAPSHOT = "snapshot.json";
     private static final String HISTORY = "query-history.jsonl";
     private static final String REVISION = "revision";
@@ -37,6 +63,12 @@ public final class RevisionStore {
     private final Path storageDir;
     private final ObjectMapper mapper;
     private final AtomicLong sequence = new AtomicLong();
+    private volatile PublishFailureHook failureHook;
+
+    /** Registers (or clears with {@code null}) a crash-injection hook. */
+    public void setFailureHook(PublishFailureHook hook) {
+        this.failureHook = hook;
+    }
 
     public RevisionStore(Path storageDir) {
         this.storageDir = storageDir;
@@ -59,6 +91,10 @@ public final class RevisionStore {
     }
 
     public synchronized void saveSnapshot(PointerAnalysisSnapshot snapshot) throws IOException {
+        PublishFailureHook hook = failureHook;
+        if (hook != null) {
+            hook.checkpoint(PublishPoint.BEFORE_SNAPSHOT_WRITE, snapshot.revision());
+        }
         Path tmp = storageDir.resolve(SNAPSHOT + ".tmp");
         byte[] bytes = mapper.writeValueAsBytes(snapshot);
         Files.write(tmp, bytes, StandardOpenOption.CREATE, StandardOpenOption.TRUNCATE_EXISTING,
@@ -69,9 +105,15 @@ public final class RevisionStore {
         } catch (IOException atomicFailure) {
             Files.move(tmp, snapshotPath(), StandardCopyOption.REPLACE_EXISTING);
         }
+        if (hook != null) {
+            hook.checkpoint(PublishPoint.AFTER_SNAPSHOT_BEFORE_MARKER, snapshot.revision());
+        }
         Files.writeString(storageDir.resolve(REVISION), Long.toString(snapshot.revision()),
                 StandardCharsets.UTF_8, StandardOpenOption.CREATE,
                 StandardOpenOption.TRUNCATE_EXISTING, StandardOpenOption.WRITE);
+        if (hook != null) {
+            hook.checkpoint(PublishPoint.AFTER_MARKER, snapshot.revision());
+        }
     }
 
     public synchronized PointerAnalysisSnapshot loadLatestSnapshot() throws IOException {
@@ -88,6 +130,39 @@ public final class RevisionStore {
             return snapshot == null ? 0L : snapshot.revision();
         }
         return Long.parseLong(Files.readString(revisionPath, StandardCharsets.UTF_8).trim());
+    }
+
+    /**
+     * Reconciles the on-disk revision marker with the durable snapshot after a
+     * crash. The snapshot file is the source of truth: its atomic move is the
+     * commit point. A missing/stale marker is refreshed from the snapshot; a
+     * marker without a snapshot is removed. Returns the aligned revision (or
+     * {@code 0} when no snapshot exists).
+     */
+    public synchronized long reconcileMarkerWithSnapshot() throws IOException {
+        PointerAnalysisSnapshot snapshot =
+                Files.exists(snapshotPath()) ? loadLatestSnapshot() : null;
+        long snapshotRevision = snapshot == null ? 0L : snapshot.revision();
+        Path revisionPath = storageDir.resolve(REVISION);
+        long markerRevision = 0L;
+        if (Files.exists(revisionPath)) {
+            try {
+                markerRevision = Long.parseLong(
+                        Files.readString(revisionPath, StandardCharsets.UTF_8).trim());
+            } catch (NumberFormatException malformed) {
+                markerRevision = -1L;
+            }
+        }
+        if (markerRevision != snapshotRevision) {
+            if (snapshotRevision == 0L) {
+                Files.deleteIfExists(revisionPath);
+            } else {
+                Files.writeString(revisionPath, Long.toString(snapshotRevision),
+                        StandardCharsets.UTF_8, StandardOpenOption.CREATE,
+                        StandardOpenOption.TRUNCATE_EXISTING, StandardOpenOption.WRITE);
+            }
+        }
+        return snapshotRevision;
     }
 
     public synchronized void markApplied(long revision) throws IOException {

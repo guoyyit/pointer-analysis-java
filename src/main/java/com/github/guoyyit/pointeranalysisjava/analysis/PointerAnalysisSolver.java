@@ -76,11 +76,31 @@ public final class PointerAnalysisSolver {
         solver.useProgram(nextProgram);
         PointerAnalysisSnapshot snapshot =
                 solver.incremental(previousProgram, changeSet, previousSnapshot.revision());
+        this.lastIncrementalStats = solver.incrementalStats;
         engine = solver;
         return snapshot;
     }
 
     private Solver engine;
+
+    /**
+     * Deterministic, timing-independent work counters for the most recent
+     * incremental update. Used to assert that re-analysis cost tracks the
+     * affected region rather than total program size.
+     *
+     * @param affectedSites        statement sites belonging to changed files
+     * @param derivationsRemoved   derivations torn down (including cascades)
+     * @param derivationsRegistered derivations registered in the new run
+     */
+    public record IncrementalStats(int affectedSites, long derivationsRemoved,
+                                   long derivationsRegistered) {
+    }
+
+    private IncrementalStats lastIncrementalStats;
+
+    public IncrementalStats lastIncrementalStats() {
+        return lastIncrementalStats;
+    }
 
     /** A node in the provenance graph. */
     sealed interface Node extends Comparable<Node>
@@ -280,6 +300,7 @@ public final class PointerAnalysisSolver {
         private final Map<Deriv, Boolean> derivations = new HashMap<>();
         private final Map<Node, Set<Deriv>> supportsOf = new HashMap<>();
         private final Map<Node, Set<Deriv>> derivsUsing = new HashMap<>();
+        private final Map<String, Set<Deriv>> derivsByRoot = new HashMap<>();
         private final Set<Node> queued = new HashSet<>();
         private final Deque<Node> worklist = new ArrayDeque<>();
 
@@ -303,6 +324,7 @@ public final class PointerAnalysisSolver {
         void useProgram(Program program) {
             this.program = program;
             this.matchedProgram = program;
+            buildProgramIndexes();
         }
 
         boolean matches(Program program) {
@@ -319,6 +341,25 @@ public final class PointerAnalysisSolver {
 
         private String entryKey() {
             return config.entryClass() + "#" + config.entryMethod() + "/0";
+        }
+
+        private final Map<String, Stmt> stmtBySite = new HashMap<>();
+        private final Map<String, JMethod> methodBySite = new HashMap<>();
+        private final Map<String, String> allocTypeBySite = new HashMap<>();
+
+        private void buildProgramIndexes() {
+            stmtBySite.clear();
+            methodBySite.clear();
+            allocTypeBySite.clear();
+            for (JMethod method : program.allMethods()) {
+                for (Stmt stmt : method.body()) {
+                    stmtBySite.put(stmt.site(), stmt);
+                    methodBySite.put(stmt.site(), method);
+                    if (stmt instanceof Stmt.New created) {
+                        allocTypeBySite.put(created.allocSite(), created.type());
+                    }
+                }
+            }
         }
 
         PointerAnalysisSnapshot runFromScratch(long revision) {
@@ -361,17 +402,24 @@ public final class PointerAnalysisSolver {
 
         PointerAnalysisSnapshot incremental(Program oldProgram, ChangeSet changeSet,
                                             long previousRevision) {
+            removalsSinceStart = 0L;
+            registrationsSinceStart = 0L;
+            int affectedSiteCount = 0;
             if (changeSet != null) {
                 Set<String> affectedSites = new TreeSet<>();
                 affectedSites.addAll(sitesOfFiles(oldProgram, changeSet.changedFiles()));
                 affectedSites.addAll(sitesOfFiles(oldProgram, changeSet.deletedFiles()));
                 affectedSites.addAll(sitesOfFiles(program, changeSet.addedFiles()));
                 affectedSites.addAll(sitesOfFiles(program, changeSet.changedFiles()));
+                affectedSiteCount = affectedSites.size();
                 removeRootedAt(affectedSites);
             }
             registerEntryReach();
             drain();
-            return materialize(previousRevision + 1);
+            PointerAnalysisSnapshot snapshot = materialize(previousRevision + 1);
+            incrementalStats = new IncrementalStats(affectedSiteCount,
+                    removalsSinceStart, registrationsSinceStart);
+            return snapshot;
         }
 
         private Set<String> sitesOfFiles(Program source, Set<String> files) {
@@ -397,18 +445,33 @@ public final class PointerAnalysisSolver {
                 return;
             }
             Set<Deriv> toRemove = new HashSet<>();
-            for (Deriv deriv : derivations.keySet()) {
-                if (sites.contains(deriv.rootSite())) {
-                    toRemove.add(deriv);
-                }
+            for (String site : sites) {
+                toRemove.addAll(derivsByRoot.getOrDefault(site, Set.of()));
             }
+            if (toRemove.isEmpty()) {
+                return;
+            }
+            Set<Node> reFireCandidates = new HashSet<>();
             Deque<Deriv> removalQueue = new ArrayDeque<>(toRemove);
             while (!removalQueue.isEmpty()) {
                 Deriv deriv = removalQueue.pollFirst();
                 if (!derivations.containsKey(deriv)) {
                     continue;
                 }
+                for (Node prerequisite : deriv.prerequisites()) {
+                    if (present.contains(prerequisite)) {
+                        reFireCandidates.add(prerequisite);
+                    }
+                }
                 derivations.remove(deriv);
+                removalsSinceStart++;
+                Set<Deriv> sameRoot = derivsByRoot.get(deriv.rootSite());
+                if (sameRoot != null) {
+                    sameRoot.remove(deriv);
+                    if (sameRoot.isEmpty()) {
+                        derivsByRoot.remove(deriv.rootSite());
+                    }
+                }
                 Node produced = deriv.produced();
                 Set<Deriv> supports = supportsOf.get(produced);
                 if (supports == null) {
@@ -422,6 +485,11 @@ public final class PointerAnalysisSolver {
                             derivsUsing.getOrDefault(produced, Set.of()))) {
                         removalQueue.add(downstream);
                     }
+                }
+            }
+            for (Node producer : reFireCandidates) {
+                if (present.contains(producer) && queued.add(producer)) {
+                    worklist.add(producer);
                 }
             }
         }
@@ -460,8 +528,10 @@ public final class PointerAnalysisSolver {
             if (derivations.containsKey(deriv)) {
                 return;
             }
+            registrationsSinceStart++;
             derivations.put(deriv, Boolean.TRUE);
             supportsOf.computeIfAbsent(produced, ignored -> new HashSet<>()).add(deriv);
+            derivsByRoot.computeIfAbsent(rootSite, ignored -> new HashSet<>()).add(deriv);
             for (Node prerequisite : prerequisites) {
                 derivsUsing.computeIfAbsent(prerequisite, ignored -> new HashSet<>()).add(deriv);
             }
@@ -729,6 +799,10 @@ public final class PointerAnalysisSolver {
         private final Map<Var, List<StoreNode>> storeIndex = new HashMap<>();
         private final Map<String, List<LoadNode>> loadByFieldIndex = new HashMap<>();
 
+        private long removalsSinceStart;
+        private long registrationsSinceStart;
+        private IncrementalStats incrementalStats;
+
         private List<CopyNode> copyEdgesFrom(Var from) {
             return copyIndex.getOrDefault(from, List.of());
         }
@@ -765,14 +839,7 @@ public final class PointerAnalysisSolver {
         }
 
         private String allocationType(String allocSite) {
-            for (JMethod method : program.allMethods()) {
-                for (Stmt stmt : method.body()) {
-                    if (stmt instanceof Stmt.New n && n.allocSite().equals(allocSite)) {
-                        return n.type();
-                    }
-                }
-            }
-            return null;
+            return allocTypeBySite.get(allocSite);
         }
 
         private List<String> classChain(String className) {
@@ -788,25 +855,11 @@ public final class PointerAnalysisSolver {
         }
 
         private Stmt statementAt(String site) {
-            for (JMethod method : program.allMethods()) {
-                for (Stmt stmt : method.body()) {
-                    if (stmt.site().equals(site)) {
-                        return stmt;
-                    }
-                }
-            }
-            return null;
+            return stmtBySite.get(site);
         }
 
         private JMethod methodContainingSite(String site) {
-            for (JMethod method : program.allMethods()) {
-                for (Stmt stmt : method.body()) {
-                    if (stmt.site().equals(site)) {
-                        return method;
-                    }
-                }
-            }
-            return null;
+            return methodBySite.get(site);
         }
 
         private Stmt.Invoke invokeAt(String site) {

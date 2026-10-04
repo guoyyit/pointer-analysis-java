@@ -8,6 +8,8 @@ import com.github.guoyyit.pointeranalysisjava.ir.Program;
 import com.github.guoyyit.pointeranalysisjava.model.AccessPath;
 import com.github.guoyyit.pointeranalysisjava.model.Context;
 import com.github.guoyyit.pointeranalysisjava.model.Obj;
+import com.github.guoyyit.pointeranalysisjava.parser.ParseOutcome;
+import com.github.guoyyit.pointeranalysisjava.parser.ParseStats;
 import com.github.guoyyit.pointeranalysisjava.parser.SourceParser;
 import com.github.guoyyit.pointeranalysisjava.persistence.QueryRecord;
 import com.github.guoyyit.pointeranalysisjava.persistence.RevisionStore;
@@ -23,6 +25,9 @@ import java.util.TreeSet;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.concurrent.locks.ReentrantLock;
 import java.util.stream.Collectors;
+
+import java.util.SortedSet;
+import java.util.TreeSet;
 
 /**
  * Entry point of the analysis service.
@@ -47,6 +52,11 @@ public final class AnalysisService {
     private AnalysisConfig config = AnalysisConfig.defaults();
     private Program currentProgram;
     private PointerAnalysisSolver solver;
+    private volatile ParseStats lastParseStats;
+    private volatile long lastSolveMillis;
+    private volatile long lastIncrementalMillis;
+    private volatile String lastUpdateOutcome;
+    private volatile PointerAnalysisSolver.IncrementalStats lastIncrementalWork;
 
     public AnalysisService(RevisionStore store) {
         this.store = Objects.requireNonNull(store);
@@ -55,6 +65,7 @@ public final class AnalysisService {
 
     private void recover() {
         try {
+            store.reconcileMarkerWithSnapshot();
             PointerAnalysisSnapshot snapshot = store.loadLatestSnapshot();
             if (snapshot != null) {
                 this.config = snapshot.config();
@@ -84,10 +95,14 @@ public final class AnalysisService {
         writerLock.lock();
         try {
             this.config = requested != null ? requested : AnalysisConfig.defaults();
-            Program program = SourceParser.parse(pathToContent);
+            ParseOutcome parsed = parseSources(pathToContent, this.config.parallelism());
+            Program program = parsed.program();
             this.solver = new PointerAnalysisSolver(this.config);
+            long start = System.nanoTime();
             PointerAnalysisSnapshot snapshot = solver.solve(program);
+            this.lastSolveMillis = (System.nanoTime() - start) / 1_000_000L;
             this.currentProgram = program;
+            this.lastUpdateOutcome = "full-build";
             return publish(snapshot);
         } finally {
             writerLock.unlock();
@@ -98,9 +113,21 @@ public final class AnalysisService {
         writerLock.lock();
         try {
             requireReady();
-            Program nextProgram = SourceParser.parse(fullSourcesAfterChange);
+            ParseOutcome parsed =
+                    parseSources(fullSourcesAfterChange, config.parallelism());
+            Program nextProgram = parsed.program();
             ChangeSet changeSet = ChangeSet.diff(currentProgram, nextProgram);
             PointerAnalysisSnapshot previous = published.get().snapshot();
+            if (changeSet.isEmpty()) {
+                // Same sources (e.g. a re-submitted request or a retry after
+                // restart): nothing to apply. Return the existing revision with
+                // no new snapshot, no revision bump and no query-history side
+                // effects.
+                this.lastIncrementalMillis = 0L;
+                this.lastUpdateOutcome = "no-op-identical-sources";
+                return published.get();
+            }
+            long start = System.nanoTime();
             PointerAnalysisSnapshot next;
             if (solver != null) {
                 next = solver.update(currentProgram, previous, nextProgram, changeSet);
@@ -110,21 +137,35 @@ public final class AnalysisService {
                 next = fresh.update(currentProgram, previous, nextProgram, changeSet);
                 this.solver = fresh;
             }
+            this.lastIncrementalMillis = (System.nanoTime() - start) / 1_000_000L;
             this.currentProgram = nextProgram;
+            this.lastUpdateOutcome = "incremental";
+            this.lastIncrementalWork = this.solver.lastIncrementalStats();
             return publish(next);
         } finally {
             writerLock.unlock();
         }
     }
 
+    private ParseOutcome parseSources(Map<String, String> sources, int parallelism) {
+        ParseOutcome outcome = SourceParser.parse(sources, parallelism);
+        this.lastParseStats = outcome.stats();
+        return outcome;
+    }
+
     public RevisionView rebuild(Map<String, String> fullSourcesAfterChange) {
         writerLock.lock();
         try {
             requireReady();
-            Program nextProgram = SourceParser.parse(fullSourcesAfterChange);
+            ParseOutcome parsed =
+                    parseSources(fullSourcesAfterChange, config.parallelism());
+            Program nextProgram = parsed.program();
             this.solver = new PointerAnalysisSolver(config);
+            long start = System.nanoTime();
             PointerAnalysisSnapshot next = solver.solve(nextProgram);
+            this.lastSolveMillis = (System.nanoTime() - start) / 1_000_000L;
             this.currentProgram = nextProgram;
+            this.lastUpdateOutcome = "full-rebuild";
             return publish(next);
         } finally {
             writerLock.unlock();
@@ -143,7 +184,8 @@ public final class AnalysisService {
         } finally {
             writerLock.unlock();
         }
-        Program nextProgram = SourceParser.parse(fullSourcesAfterChange);
+        Program nextProgram =
+                parseSources(fullSourcesAfterChange, snapshotConfig.parallelism()).program();
         ChangeSet changeSet = ChangeSet.diff(programBefore, nextProgram);
 
         PointerAnalysisSolver incrementalSolver = new PointerAnalysisSolver(snapshotConfig);
@@ -245,6 +287,50 @@ public final class AnalysisService {
 
     public AnalysisConfig config() {
         return config;
+    }
+
+    /** Revision recorded by the durable marker after crash reconciliation. */
+    public long persistedRevision() {
+        try {
+            return store.lastAppliedRevision();
+        } catch (IOException e) {
+            throw new UncheckedIOException("cannot read persisted revision", e);
+        }
+    }
+
+    /** Observable execution details of the most recent analysis operation. */
+    public ExecutionStats executionStats() {
+        ParseStats parse = lastParseStats;
+        int parseParallelism = parse == null ? config.parallelism() : parse.parallelism();
+        int parseFiles = parse == null ? 0 : parse.files();
+        SortedSet<String> parseWorkers =
+                parse == null ? new TreeSet<>() : new TreeSet<>(parse.workerThreads());
+        long parseMillis = parse == null ? 0L : parse.elapsedMillis();
+        return new ExecutionStats(config.parallelism(), parseParallelism, parseFiles,
+                parseWorkers, parseMillis, lastSolveMillis, lastIncrementalMillis,
+                lastUpdateOutcome == null ? "none" : lastUpdateOutcome,
+                lastIncrementalWork == null ? null : lastIncrementalWork.affectedSites(),
+                lastIncrementalWork == null ? null : lastIncrementalWork.derivationsRemoved(),
+                lastIncrementalWork == null ? null
+                        : lastIncrementalWork.derivationsRegistered());
+    }
+
+    /**
+     * Timing and worker details of the latest build/update. The worker-thread
+     * set proves the configured parallelism changed execution, not just
+     * configuration plumbing.
+     */
+    public record ExecutionStats(int configuredParallelism,
+                                 int parseParallelism,
+                                 int parsedFiles,
+                                 SortedSet<String> parserWorkerThreads,
+                                 long parseMillis,
+                                 long lastSolveMillis,
+                                 long lastIncrementalMillis,
+                                 String lastOutcome,
+                                 Integer affectedSites,
+                                 Long derivationsRemoved,
+                                 Long derivationsRegistered) {
     }
 
     /** Result of cross-checking incremental state against a full rebuild. */

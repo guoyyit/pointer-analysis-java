@@ -4,6 +4,7 @@ import com.github.guoyyit.pointeranalysisjava.analysis.PointerAnalysisSnapshot;
 
 import java.util.List;
 import java.util.Map;
+import java.util.SortedSet;
 
 /**
  * HTTP request/response DTOs.
@@ -29,8 +30,14 @@ public final class Requests {
     public record AliasRequest(String context, String left, String right) {
     }
 
-    public record StatusResponse(long revision, int files, int methods,
-                                 long contexts, int variables, int objects) {
+    public record StatusDetailedResponse(long revision, int files, int methods,
+                                         long contexts, int variables, int objects,
+                                         int configuredParallelism, int parseParallelism,
+                                         SortedSet<String> parserWorkerThreads,
+                                         long parseMillis, long solveMillis,
+                                         long incrementalMillis, String lastOutcome,
+                                         Integer affectedSites, Long derivationsRemoved,
+                                         Long derivationsRegistered) {
     }
 
     public record PointsToResponse(long revision,

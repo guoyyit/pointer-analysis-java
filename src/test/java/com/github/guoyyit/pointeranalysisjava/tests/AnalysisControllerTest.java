@@ -35,11 +35,14 @@ class AnalysisControllerTest {
     @Test
     void fullWorkflowOverHttp() throws Exception {
         String build = "{\"sources\":{\"Main.java\":" + quote(SOURCE)
-                + "},\"config\":{\"contextK\":1}}";
+                + "},\"config\":{\"contextK\":1,\"parallelism\":2}}";
         mvc.perform(post("/api/build").contentType(MediaType.APPLICATION_JSON).content(build))
                 .andExpect(status().isOk())
                 .andExpect(jsonPath("$.revision").value(1))
-                .andExpect(jsonPath("$.objects").value(2));
+                .andExpect(jsonPath("$.objects").value(2))
+                .andExpect(jsonPath("$.configuredParallelism").value(2))
+                .andExpect(jsonPath("$.parseParallelism").value(2))
+                .andExpect(jsonPath("$.lastOutcome").value("full-build"));
 
         mvc.perform(post("/api/query/points-to")
                         .contentType(MediaType.APPLICATION_JSON)
@@ -55,10 +58,40 @@ class AnalysisControllerTest {
                 .andExpect(status().isOk())
                 .andExpect(jsonPath("$.answer").value("false"));
 
-        mvc.perform(get("/api/status")).andExpect(status().isOk());
+        mvc.perform(get("/api/status"))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.revision").value(1))
+                .andExpect(jsonPath("$.configuredParallelism").value(2))
+                .andExpect(jsonPath("$.parserWorkerThreads").isArray());
         mvc.perform(get("/api/history"))
                 .andExpect(status().isOk())
                 .andExpect(jsonPath("$.length()").value(2));
+    }
+
+    @Test
+    void identicalUpdateIsIdempotentOverHttp() throws Exception {
+        int historyBefore = historyLength();
+        String build = "{\"sources\":{\"Main.java\":" + quote(SOURCE) + "}}";
+        mvc.perform(post("/api/build").contentType(MediaType.APPLICATION_JSON).content(build))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.revision").value(1));
+
+        mvc.perform(post("/api/update")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("{\"sources\":{\"Main.java\":" + quote(SOURCE) + "}}"))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.revision").value(1))
+                .andExpect(jsonPath("$.lastOutcome").value("no-op-identical-sources"));
+
+        mvc.perform(get("/api/history"))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.length()").value(historyBefore));
+    }
+
+    private int historyLength() throws Exception {
+        String body = mvc.perform(get("/api/history")).andReturn().getResponse()
+                .getContentAsString();
+        return body.equals("[]") ? 0 : body.split("\"sequence\"").length - 1;
     }
 
     private static String quote(String text) {

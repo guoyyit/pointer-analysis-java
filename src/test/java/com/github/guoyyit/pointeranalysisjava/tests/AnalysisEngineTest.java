@@ -200,6 +200,56 @@ class AnalysisEngineTest {
         assertEquals(full.varPointsTo(), incremental.varPointsTo());
     }
 
+    @Test
+    void changedReachableCalleeFileRePublishesNewStatements() {
+        String leafV1 = """
+                class Leaf {
+                  Helper get() {
+                    Helper h = new Helper();
+                    return h;
+                  }
+                }
+                """;
+        String leafV2 = """
+                class Leaf {
+                  Helper get() {
+                    Helper h = new Helper();
+                    Extra e = new Extra();
+                    return h;
+                  }
+                }
+                class Extra {
+                }
+                """;
+        String mainSrc = """
+                class Main {
+                  static void main() {
+                    Leaf leaf = new Leaf();
+                    Helper h = leaf.get();
+                  }
+                }
+                class Helper {
+                }
+                """;
+        AnalysisConfig config = new AnalysisConfig(1, 2, "Main", "main");
+        Program p1 = SourceParser.parse(Map.of("Main.java", mainSrc, "Leaf.java", leafV1));
+        PointerAnalysisSolver solver = new PointerAnalysisSolver(config);
+        PointerAnalysisSnapshot s1 = solver.solve(p1);
+        Program p2 = SourceParser.parse(Map.of("Main.java", mainSrc, "Leaf.java", leafV2));
+        PointerAnalysisSnapshot incremental =
+                solver.update(p1, s1, p2, ChangeSet.diff(p1, p2));
+        PointerAnalysisSnapshot full = new PointerAnalysisSolver(config).solve(p2);
+
+        assertEquals(full.varPointsTo(), incremental.varPointsTo(),
+                "surviving reachability into the edited callee must re-fire and "
+                        + "publish the new allocation");
+        assertEquals(full.fieldPointsTo(), incremental.fieldPointsTo());
+        PointerAnalysisSolver.IncrementalStats work = solver.lastIncrementalStats();
+        assertTrue(work.affectedSites() >= 3);
+        assertTrue(work.derivationsRegistered() > 0,
+                "the edited reachable file must re-register derivations");
+    }
+
     private String callersProgram() {
         return """
                 class Main {

@@ -14,7 +14,14 @@ import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.TreeSet;
 import java.util.TreeMap;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.TreeSet;
 
 /**
@@ -36,27 +43,107 @@ public final class SourceParser {
     }
 
     public static Program parse(Map<String, String> pathToContent) {
+        return parse(pathToContent, 1).program();
+    }
+
+    /**
+     * Parses all files using up to {@code parallelism} worker threads.
+     *
+     * <p>Files are independent parse units: each file is tokenized and parsed
+     * by a single worker, and results are merged in deterministic (sorted)
+     * path order on the calling thread. The returned {@link Program} is
+     * therefore byte-for-byte identical to a sequential parse, while the
+     * {@link ParseStats} expose how many workers actually ran.
+     */
+    public static ParseOutcome parse(Map<String, String> pathToContent, int parallelism) {
+        if (parallelism < 1) {
+            throw new IllegalArgumentException("parallelism must be >= 1");
+        }
+        long start = System.nanoTime();
+        List<String> paths = new ArrayList<>(pathToContent.keySet());
+        Collections.sort(paths);
+
+        Set<String> activeWorkers = ConcurrentHashMap.newKeySet();
+        List<ParsedFile> parsedFiles = new ArrayList<>(paths.size());
+
+        if (parallelism == 1 || paths.size() <= 1) {
+            for (String path : paths) {
+                parsedFiles.add(parseOneFile(path, pathToContent.get(path), activeWorkers));
+            }
+        } else {
+            int poolSize = Math.min(parallelism, paths.size());
+            ExecutorService pool = Executors.newFixedThreadPool(poolSize, parserThreadFactory());
+            try {
+                List<Future<ParsedFile>> futures = new ArrayList<>(paths.size());
+                for (String path : paths) {
+                    String content = pathToContent.get(path);
+                    futures.add(pool.submit(() -> parseOneFile(path, content, activeWorkers)));
+                }
+                for (Future<ParsedFile> future : futures) {
+                    try {
+                        parsedFiles.add(future.get());
+                    } catch (InterruptedException e) {
+                        Thread.currentThread().interrupt();
+                        throw new ParseException("interrupted while parsing sources", e);
+                    } catch (ExecutionException e) {
+                        Throwable cause = e.getCause();
+                        if (cause instanceof RuntimeException runtime) {
+                            throw runtime;
+                        }
+                        throw new ParseException("failed to parse sources", cause);
+                    }
+                }
+            } finally {
+                pool.shutdown();
+            }
+        }
+
         TreeMap<String, JClass> classes = new TreeMap<>();
         TreeMap<String, List<String>> classesByFile = new TreeMap<>();
         TreeMap<String, String> sourceHashByFile = new TreeMap<>();
-
-        List<String> paths = new ArrayList<>(pathToContent.keySet());
-        Collections.sort(paths);
-        for (String path : paths) {
-            String content = pathToContent.get(path);
-            sourceHashByFile.put(path, sha256(content));
-            List<Token> tokens = Lexer.tokenize(path, content);
-            List<JClass> fileClasses = new ClassParser(path, tokens).parseClasses();
+        // Futures are awaited in sorted path order, so merging is deterministic
+        // regardless of the order in which workers finished.
+        for (ParsedFile parsed : parsedFiles) {
+            sourceHashByFile.put(parsed.path(), parsed.hash());
             List<String> classNames = new ArrayList<>();
-            for (JClass parsed : fileClasses) {
-                if (classes.putIfAbsent(parsed.name(), parsed) != null) {
-                    throw new ParseException("duplicate class definition: " + parsed.name());
+            for (JClass parsedClass : parsed.classes()) {
+                if (classes.putIfAbsent(parsedClass.name(), parsedClass) != null) {
+                    throw new ParseException(
+                            "duplicate class definition: " + parsedClass.name());
                 }
-                classNames.add(parsed.name());
+                classNames.add(parsedClass.name());
             }
-            classesByFile.put(path, List.copyOf(classNames));
+            classesByFile.put(parsed.path(), List.copyOf(classNames));
         }
-        return new Program(classes, classesByFile, sourceHashByFile);
+
+        Program program = new Program(classes, classesByFile, sourceHashByFile);
+        long elapsed = (System.nanoTime() - start) / 1_000_000L;
+        ParseStats stats = new ParseStats(Math.max(1, parallelism), pathToContent.size(),
+                new TreeSet<>(activeWorkers), elapsed);
+        return new ParseOutcome(program, stats);
+    }
+
+    private record ParsedFile(String path, String hash, List<JClass> classes) {
+    }
+
+    private static ParsedFile parseOneFile(String path, String content, Set<String> activeWorkers) {
+        activeWorkers.add(Thread.currentThread().getName());
+        List<Token> tokens = Lexer.tokenize(path, content);
+        List<JClass> fileClasses = new ClassParser(path, tokens).parseClasses();
+        return new ParsedFile(path, sha256(content), List.copyOf(fileClasses));
+    }
+
+    private static final AtomicInteger PARSER_POOL_SEQ = new AtomicInteger();
+
+    private static java.util.concurrent.ThreadFactory parserThreadFactory() {
+        int poolSeq = PARSER_POOL_SEQ.incrementAndGet();
+        AtomicInteger threadSeq = new AtomicInteger();
+        return runnable -> {
+            Thread thread = new Thread(runnable,
+                    "pointer-analysis-parser-" + poolSeq + "-" + threadSeq.incrementAndGet());
+            thread.setDaemon(true);
+            return thread;
+        };
     }
 
     static String sha256(String content) {

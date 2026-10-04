@@ -22,7 +22,6 @@ import java.util.Map;
 import static com.github.guoyyit.pointeranalysisjava.web.Requests.AliasRequest;
 import static com.github.guoyyit.pointeranalysisjava.web.Requests.BuildRequest;
 import static com.github.guoyyit.pointeranalysisjava.web.Requests.PointsToRequest;
-import static com.github.guoyyit.pointeranalysisjava.web.Requests.StatusResponse;
 import static com.github.guoyyit.pointeranalysisjava.web.Requests.UpdateRequest;
 
 /**
@@ -48,20 +47,20 @@ public final class AnalysisController {
     }
 
     @PostMapping("/build")
-    public StatusResponse build(@RequestBody BuildRequest request) {
+    public Requests.StatusDetailedResponse build(@RequestBody BuildRequest request) {
         AnalysisConfig config = resolveConfig(request.config());
         RevisionView view = service.build(request.sources(), config);
-        return status(view);
+        return detailedStatus(view);
     }
 
     @PostMapping("/update")
-    public StatusResponse update(@RequestBody UpdateRequest request) {
-        return status(service.update(request.sources()));
+    public Requests.StatusDetailedResponse update(@RequestBody UpdateRequest request) {
+        return detailedStatus(service.update(request.sources()));
     }
 
     @PostMapping("/rebuild")
-    public StatusResponse rebuild(@RequestBody UpdateRequest request) {
-        return status(service.rebuild(request.sources()));
+    public Requests.StatusDetailedResponse rebuild(@RequestBody UpdateRequest request) {
+        return detailedStatus(service.rebuild(request.sources()));
     }
 
     @PostMapping("/verify")
@@ -82,12 +81,31 @@ public final class AnalysisController {
     }
 
     @GetMapping("/status")
-    public ResponseEntity<StatusResponse> status() {
+    public ResponseEntity<Requests.StatusDetailedResponse> status() {
         if (!service.isReady()) {
-            return ResponseEntity.status(HttpStatus.SERVICE_UNAVAILABLE)
-                    .body(new StatusResponse(0, 0, 0, 0, 0, 0));
+            return ResponseEntity.status(HttpStatus.SERVICE_UNAVAILABLE).build();
         }
-        return ResponseEntity.ok(status(service.currentView()));
+        return ResponseEntity.ok(detailedStatus(service.currentView()));
+    }
+
+    private Requests.StatusDetailedResponse detailedStatus(RevisionView view) {
+        AnalysisService.ExecutionStats stats = service.executionStats();
+        long contexts = view.snapshot().varPointsTo().keySet().stream()
+                .map(v -> v.context())
+                .distinct()
+                .count();
+        int variables = view.snapshot().varPointsTo().size();
+        int objects = countObjects(view);
+        return new Requests.StatusDetailedResponse(
+                view.revision(),
+                view.snapshot().program().sourceHashByFile().size(),
+                view.snapshot().program().allMethods().size(),
+                contexts, variables, objects,
+                stats.configuredParallelism(), stats.parseParallelism(),
+                stats.parserWorkerThreads(), stats.parseMillis(), stats.lastSolveMillis(),
+                stats.lastIncrementalMillis(), stats.lastOutcome(),
+                stats.affectedSites(), stats.derivationsRemoved(),
+                stats.derivationsRegistered());
     }
 
     @GetMapping("/history")
@@ -105,18 +123,6 @@ public final class AnalysisController {
                 dto.parallelism() != null ? dto.parallelism() : defaults.parallelism(),
                 dto.entryClass() != null ? dto.entryClass() : defaults.entryClass(),
                 dto.entryMethod() != null ? dto.entryMethod() : defaults.entryMethod());
-    }
-
-    private StatusResponse status(RevisionView view) {
-        long contexts = view.snapshot().varPointsTo().keySet().stream()
-                .map(v -> v.context())
-                .distinct()
-                .count();
-        int variables = view.snapshot().varPointsTo().size();
-        return new StatusResponse(view.revision(),
-                view.snapshot().program().sourceHashByFile().size(),
-                view.snapshot().program().allMethods().size(),
-                contexts, variables, countObjects(view));
     }
 
     private int countObjects(RevisionView view) {
